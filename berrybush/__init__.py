@@ -27,6 +27,7 @@ from .blender import (
     bone,
     brresexport,
     brresimport,
+    lighting,
     material,
     mesh,
     preferences,
@@ -85,6 +86,7 @@ classes = (
     bone.BoneSettings,
     brresimport.ImportSettings,
     brresexport.ExportSettings,
+    *lighting.CLASSES,
     scene.SceneSettings,
     # ui
     material.MatPanel,
@@ -118,6 +120,7 @@ classes = (
     brresexport.ImagePanel,
     brresexport.AnimPanel,
     render.FilmPanel,
+    *lighting.UI_CLASSES,
     # operators
     backup.ClearBackups,
     proputils.CustomIDCollOpAdd,

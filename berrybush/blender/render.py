@@ -17,9 +17,11 @@ from .common import ( # pylint: disable=unused-import
 )
 from .mesh import MeshSettings
 from .shaders import (
-    BRRES_SHADER, POSTPROCESS_SHADER,
-    ShaderTevStage, ShaderTexture, ShaderIndTex, ShaderLightChan, ShaderMaterial, ShaderMesh
+    BRRES_SHADER, POSTPROCESS_SHADER, LIGHT_POST_SHADER,
+    ShaderTevStage, ShaderTexture, ShaderIndTex, ShaderLightChan, ShaderMaterial, ShaderMesh,
+    ShaderSceneLight, ShaderLightSet, ShaderFog, ShaderSceneLighting
 )
+from . import lightrender
 from ..wii import gx, tex0
 
 
@@ -530,6 +532,10 @@ class RenderMaterial:
         shaderMat.alphaTestEnable = True
         shaderMat.enableConstAlpha = alphaSettings.enableConstVal
         shaderMat.constAlpha = alphaSettings.constVal
+        # light & fog sets
+        misc = brres.miscSettings
+        shaderMat.lightSet = misc.lightSet - 1 if misc.useLightSet else -1
+        shaderMat.fogSet = misc.fogSet - 1 if misc.useFogSet else -1
         # depth settings
         depthSettings = brres.depthSettings
         shaderMat.enableDepthTest = depthSettings.enableDepthTest
@@ -821,6 +827,355 @@ class PreviewObjectManager(StandardObjectManager[MaterialManagerT]):
         return (["Col"] * gx.MAX_CLR_ATTRS, ["UVMap"] * gx.MAX_UV_ATTRS)
 
 
+class SceneLightingRenderer:
+    """Keeps the GPU side of the game's scene lighting: the lighting uniforms and the generated
+    light map textures."""
+
+    _EMPTY_UBO_BYTES = b"\x00" * ShaderSceneLighting.getSize()
+
+    def __init__(self):
+        self.ubo = gpu.types.GPUUniformBuf(self._EMPTY_UBO_BYTES)
+        self.state: lightrender.SceneLightingState = None
+        self._key = None
+        self._lightMaps: dict[str, int] = {}
+        """OpenGL bindcode of each light map texture, by name."""
+
+    def delete(self):
+        deleteBglTextures(list(self._lightMaps.values()))
+        self._lightMaps.clear()
+
+    def update(self, scene: bpy.types.Scene, viewMtx: Matrix, useBgl: bool):
+        """Work out the scene lighting for a camera, if anything it depends on has changed."""
+        settings = scene.brres
+        key = (
+            settings.lightingVersion, settings.activeLightingSet, settings.renderLighting,
+            tuple(round(v, 5) for row in viewMtx for v in row)
+        )
+        if key == self._key:
+            return
+        self._key = key
+        self.state = lightrender.evaluate(scene, viewMtx)
+        self.ubo.update(self._pack(self.state))
+        if useBgl:
+            self._updateLightMaps(self.state.lightMaps if self.state else {})
+
+    def _pack(self, state: lightrender.SceneLightingState) -> bytes:
+        if state is None:
+            return self._EMPTY_UBO_BYTES
+        shaderLighting = ShaderSceneLighting()
+        shaderLighting.useLights = state.useLights
+        shaderLighting.useFog = state.useFog
+        shaderLighting.unitScale = state.unitScale
+        shaderLights = []
+        for light in state.lights[:lightrender.MAX_LIGHTS]:
+            shaderLight = ShaderSceneLight()
+            if light.sent:
+                shaderLight.kind = 2 if light.specular else 1
+                shaderLight.color = tuple(light.color / 255)
+                shaderLight.useColor = light.useColor
+                shaderLight.useAlpha = light.useAlpha
+                shaderLight.angleAttn = (*light.angleAttn, 0)
+                shaderLight.distAttn = (*light.distAttn, 0)
+                if light.lightType == 1 or light.specular:
+                    # a directional light is a point light very far away
+                    shaderLight.pos = (*(light.viewDir * -1e10), 1)
+                    shaderLight.dir = (*light.viewDir, 0) if light.specular else (0, 0, 0, 0)
+                else:
+                    shaderLight.pos = (*light.viewPos, 1)
+                    shaderLight.dir = (*light.viewDir, 0) if light.lightType == 2 else (0, 0, 0, 0)
+            shaderLights.append(shaderLight)
+        shaderLighting.lights = tuple(shaderLights)
+        shaderSets = []
+        for ambient, indices in state.lightSets[:lightrender.MAX_LIGHT_SETS]:
+            shaderSet = ShaderLightSet()
+            shaderSet.ambient = ambient
+            indices = (indices + [-1] * lightrender.MAX_SET_LIGHTS)[:lightrender.MAX_SET_LIGHTS]
+            shaderSet.lights = tuple(i if i < lightrender.MAX_LIGHTS else -1 for i in indices)
+            shaderSets.append(shaderSet)
+        shaderLighting.lightSets = tuple(shaderSets)
+        shaderFogs = []
+        for fogType, start, end, color in state.fogs[:lightrender.MAX_FOGS]:
+            shaderFog = ShaderFog()
+            shaderFog.kind = fogType
+            shaderFog.start = start
+            shaderFog.end = end
+            shaderFog.color = color
+            shaderFogs.append(shaderFog)
+        shaderLighting.fogs = tuple(shaderFogs)
+        return shaderLighting.pack()
+
+    def _updateLightMaps(self, lightMaps: dict[str, np.ndarray]):
+        unused = [self._lightMaps.pop(n) for n in tuple(self._lightMaps) if n not in lightMaps]
+        deleteBglTextures(unused)
+        for name, image in lightMaps.items():
+            if name not in self._lightMaps:
+                bindcodeBuf = bgl.Buffer(bgl.GL_INT, 1)
+                bgl.glGenTextures(1, bindcodeBuf)
+                self._lightMaps[name] = bindcodeBuf[0] # pylint: disable=unsubscriptable-object
+            flattened = image.astype(np.float32).flatten()
+            buffer = bgl.Buffer(bgl.GL_FLOAT, len(flattened), flattened)
+            bgl.glPixelStorei(bgl.GL_UNPACK_ALIGNMENT, 1)
+            bgl.glBindTexture(bgl.GL_TEXTURE_2D, self._lightMaps[name])
+            bgl.glTexImage2D(bgl.GL_TEXTURE_2D, 0, bgl.GL_RGBA, image.shape[1], image.shape[0], 0,
+                             bgl.GL_RGBA, bgl.GL_FLOAT, buffer)
+
+    def bindLightMap(self, texture: ShaderTexture) -> bool:
+        """Bind the generated light map a texture stands for in the OpenGL state, if there is one.
+
+        The game replaces every texture of a model named like a light map with the generated one.
+        """
+        if not self._lightMaps or not texture.hasImg:
+            return False
+        bindcode = self._lightMaps.get(lightrender.lightMapName(texture.imgName))
+        if bindcode is None:
+            return False
+        bgl.glBindTexture(bgl.GL_TEXTURE_2D, bindcode)
+        bgl.glTexParameteri(bgl.GL_TEXTURE_2D, bgl.GL_TEXTURE_WRAP_S, texture.wrap[0])
+        bgl.glTexParameteri(bgl.GL_TEXTURE_2D, bgl.GL_TEXTURE_WRAP_T, texture.wrap[1])
+        bgl.glTexParameteri(bgl.GL_TEXTURE_2D, bgl.GL_TEXTURE_MIN_FILTER, bgl.GL_LINEAR)
+        bgl.glTexParameteri(bgl.GL_TEXTURE_2D, bgl.GL_TEXTURE_MAG_FILTER, bgl.GL_LINEAR)
+        bgl.glTexParameteri(bgl.GL_TEXTURE_2D, bgl.GL_TEXTURE_MAX_LEVEL, 0)
+        return True
+
+
+class LightingPostProcessor:
+    """Runs the post effects of the game's scene lighting, depth of field and bloom, on a drawn
+    scene.
+
+    Textures are bound with bgl, like everything of the BRRES renderer: once bgl has bound textures,
+    binds made through the gpu module have no effect.
+    """
+
+    EFB_DIMS = (640, 456)
+    """The game's frame buffer. Its effects work on copies of it at fixed fractions of this size, so
+    they do here too, whatever the size of the view."""
+
+    # passes of the shader
+    COPY = 0
+    COPY_FILTERED = 1
+    COPY_AREA = 2
+    BLOOM_BRIGHTNESS = 3
+    BLOOM_THRESHOLD = 4
+    BLOOM_BLUR = 5
+    BLOOM_BLUR_SIDE = 6
+    BLOOM_COMBINE = 7
+    BLOOM_COMPOSITE = 8
+    DOF_BLUR = 9
+    DOF_COMPOSITE = 10
+    OUTPUT = 11
+
+    def __init__(self):
+        self.shader = LIGHT_POST_SHADER
+        verts = {"position": [[-1, -1], [1, -1], [-1, 1], [1, 1]]}
+        idcs = [[0, 1, 2], [3, 2, 1]]
+        self._batch: gpu.types.GPUBatch = batch_for_shader(self.shader, 'TRIS', verts, indices=idcs)
+        self._targets: dict[str, gpu.types.GPUOffScreen] = {}
+        self._depthBindcode = 0
+        self._scissor = False
+
+    def delete(self):
+        for target in self._targets.values():
+            target.free()
+        self._targets.clear()
+        if self._depthBindcode:
+            deleteBglTextures([self._depthBindcode])
+            self._depthBindcode = 0
+
+    def _target(self, name: str, dims: tuple[int, int]) -> gpu.types.GPUOffScreen:
+        """Get the offscreen buffer of some name, made anew if its size has changed."""
+        dims = (max(int(dims[0]), 1), max(int(dims[1]), 1))
+        target = self._targets.get(name)
+        if target is None or (target.width, target.height) != dims:
+            if target is not None:
+                target.free()
+            # 8 bits per channel, like the game's frame buffer and copies
+            target = gpu.types.GPUOffScreen(*dims, format='RGBA8')
+            self._targets[name] = target
+        return target
+
+    def _bindInputs(self, textures: tuple[int, ...]):
+        for i, bindcode in enumerate(textures):
+            bgl.glActiveTexture(bgl.GL_TEXTURE0 + i)
+            bgl.glBindTexture(bgl.GL_TEXTURE_2D, bindcode)
+            if bindcode == self._depthBindcode:
+                continue # read per pixel
+            bgl.glTexParameteri(bgl.GL_TEXTURE_2D, bgl.GL_TEXTURE_MIN_FILTER, bgl.GL_LINEAR)
+            bgl.glTexParameteri(bgl.GL_TEXTURE_2D, bgl.GL_TEXTURE_MAG_FILTER, bgl.GL_LINEAR)
+            bgl.glTexParameteri(bgl.GL_TEXTURE_2D, bgl.GL_TEXTURE_WRAP_S, bgl.GL_CLAMP_TO_EDGE)
+            bgl.glTexParameteri(bgl.GL_TEXTURE_2D, bgl.GL_TEXTURE_WRAP_T, bgl.GL_CLAMP_TO_EDGE)
+        bgl.glActiveTexture(bgl.GL_TEXTURE0)
+
+    def _draw(self, mode: int, textures: tuple[int, ...], params):
+        self.shader.bind()
+        self.shader.uniform_int("mode", [mode])
+        for i in range(3):
+            param = params[i] if i < len(params) else (0, 0, 0, 0)
+            self.shader.uniform_float(f"p{i}", tuple(float(v) for v in param))
+        self._bindInputs(textures)
+        self._batch.draw(self.shader)
+
+    def _pass(self, name: str, dims, mode: int, textures: tuple[int, ...], *params) -> int:
+        """Run a pass of the shader into the offscreen buffer of some name.
+
+        Return the bindcode of the texture with the result.
+        """
+        target = self._target(name, dims)
+        with target.bind():
+            # targets differ in size, and the gpu module applies the area it has on record when
+            # drawing, so the area has to be set through it
+            gpu.state.viewport_set(0, 0, target.width, target.height)
+            self._draw(mode, textures, params)
+        return target.color_texture
+
+    def output(self, image: int, doAlpha: bool, viewport: tuple[int, int, int, int]):
+        """Draw a result of run() to an area of the active frame buffer, converted to linear color."""
+        gpu.state.viewport_set(*viewport)
+        if self._scissor:
+            bgl.glEnable(bgl.GL_SCISSOR_TEST)
+        self._draw(self.OUTPUT, (image, ), ((doAlpha, 0, 0, 0), ))
+
+    def depthTexture(self, dims: tuple[int, int]) -> int:
+        """Bindcode of a texture with a copy of the depth of the frame buffer that is bound.
+
+        (Copied on the GPU. The gpu module's read_depth() gives scrambled data for these buffers)
+        """
+        if not self._depthBindcode:
+            bindcodeBuf = bgl.Buffer(bgl.GL_INT, 1)
+            bgl.glGenTextures(1, bindcodeBuf)
+            self._depthBindcode = bindcodeBuf[0] # pylint: disable=unsubscriptable-object
+        bgl.glActiveTexture(bgl.GL_TEXTURE0)
+        bgl.glBindTexture(bgl.GL_TEXTURE_2D, self._depthBindcode)
+        bgl.glCopyTexImage2D(bgl.GL_TEXTURE_2D, 0, bgl.GL_DEPTH_COMPONENT24, 0, 0, dims[0], dims[1], 0)
+        bgl.glTexParameteri(bgl.GL_TEXTURE_2D, bgl.GL_TEXTURE_MIN_FILTER, bgl.GL_NEAREST)
+        bgl.glTexParameteri(bgl.GL_TEXTURE_2D, bgl.GL_TEXTURE_MAG_FILTER, bgl.GL_NEAREST)
+        return self._depthBindcode
+
+    @staticmethod
+    def _byte(value: float) -> int:
+        """A color byte the game makes from a float: truncated, and wrapping past 255."""
+        return int(value) & 0xFF
+
+    @staticmethod
+    def _tevFactor(byte: int) -> float:
+        """What multiplying by a color byte in a TEV stage multiplies by."""
+        return (byte + (byte >> 7)) / 256
+
+    @classmethod
+    def _blurWeight(cls, byte: int) -> float:
+        """Weight of each tap of EGG::PostEffectBlur for a color byte. Bytes below 128 are doubled
+        for the stages and halved at the end."""
+        if byte < 0x80:
+            return cls._tevFactor(cls._byte(byte * 2)) / 2
+        return cls._tevFactor(byte)
+
+    def _bloom(self, bloom, image: int) -> int:
+        """Run the game's bloom (src/bloom.cpp, a port of Mario Kart Wii's) on an image.
+
+        Return the bloom texture (at a quarter or half of the game's frame buffer size), which the
+        composite lays over the image.
+        """
+        efbW, efbH = self.EFB_DIMS
+        ratio = 2 if bloom.halfResolution else 4
+        work = (efbW // ratio, efbH // ratio)
+        texel = (1 / work[0], 1 / work[1])
+        # the screen copied at half size, drawn into a corner of the frame buffer at the work size
+        capture = self._pass("bloomCapture", (efbW // 2, efbH // 2), self.COPY_AREA, (image, ),
+                             (efbW // 2, efbH // 2, 0, 0))
+        source = capture if ratio == 2 else self._pass("bloomSource", work, self.COPY, (capture, ))
+        # its brightness, and twice what is above the threshold multiplied onto the corner
+        brightness = self._pass("bloomBrightness", work, self.BLOOM_BRIGHTNESS, (source, ))
+        thresholdScale = (16 + 219 * bloom.threshold) / 255
+        threshold = [self._byte(round(c * 255) * thresholdScale) / 255
+                     for c in bloom.thresholdColor[:3]]
+        brightFb = self._pass("bloomBrightFb", work, self.BLOOM_THRESHOLD, (source, brightness),
+                              (*threshold, 0))
+        # each copy of the corner is smoothed w/ the circular blur, not w/ the side by side one
+        filtered = bloom.fullBlur
+        bright = self._pass("bloomBright", work, self.COPY_FILTERED, (brightFb, )) if filtered \
+            else brightFb
+        if bloom.fullBlur:
+            weight = self._blurWeight(self._byte(255 * min(bloom.intensity, 1)))
+            blurredFb = self._pass("bloomBlurFb", work, self.BLOOM_BLUR, (bright, ),
+                                   (*texel, bloom.radius, 1), (weight, 0, 0, 0))
+            blurred = self._pass("bloomBlurred", work, self.COPY_FILTERED, (blurredFb, ))
+        else:
+            strength = self._tevFactor(self._byte(255 * bloom.intensity))
+            blurredFb = self._pass("bloomBlurFb", work, self.BLOOM_BLUR_SIDE, (bright, ),
+                                   (texel[0], bloom.radius, strength, 0))
+            if bloom.blurTwice:
+                blurredFb = self._pass("bloomBlurFb2", work, self.BLOOM_BLUR_SIDE, (blurredFb, ),
+                                       (texel[0], bloom.radius, strength, 0))
+            blurred = blurredFb
+        wide = blurred
+        if bloom.secondBlur:
+            # the blurred corner copied at half size & blurred again on a wider ring
+            half = (work[0] // 2, work[1] // 2)
+            small = self._pass("bloomSmall", half, self.COPY, (blurredFb, ))
+            if filtered:
+                small = self._pass("bloomSmallFiltered", half, self.COPY_FILTERED, (small, ))
+            weights = (self._blurWeight(self._byte(255 * min(bloom.secondIntensity, 1))),
+                       self._blurWeight(self._byte(255 * min(bloom.secondIntensity * .5, 1))))
+            wideFb = self._pass("bloomWideFb", half, self.BLOOM_BLUR, (small, ),
+                                (1 / half[0], 1 / half[1], bloom.secondRadius, bloom.secondPasses),
+                                (*weights, 0, 0))
+            wide = self._pass("bloomWide", half, self.COPY_FILTERED, (wideFb, )) if filtered \
+                else wideFb
+        weights = (self._tevFactor(self._byte(255 * bloom.weight)),
+                   self._tevFactor(self._byte(255 * bloom.secondWeight)))
+        combinedFb = self._pass("bloomCombinedFb", work, self.BLOOM_COMBINE, (blurred, wide),
+                                (*weights, bloom.secondBlur, 0))
+        return self._pass("bloomCombined", work, self.COPY_FILTERED, (combinedFb, ))
+
+    def run(self, state: lightrender.SceneLightingState, projectionMtx: Matrix,
+            image: int, depth: int, dims: tuple[int, int]) -> int:
+        """Apply the post effects to a drawn scene, given the bindcodes of its color & depth
+        textures and its size. Return the bindcode of the texture with the result."""
+        # the passes draw to whole buffers of their own, so the scissor of the view is off for them
+        self._scissor = bool(bgl.glIsEnabled(bgl.GL_SCISSOR_TEST))
+        bgl.glDisable(bgl.GL_SCISSOR_TEST)
+        bgl.glDisable(bgl.GL_BLEND)
+        bgl.glDisable(bgl.GL_DEPTH_TEST)
+        bgl.glDisable(bgl.GL_STENCIL_TEST)
+        bgl.glDisable(bgl.GL_CULL_FACE)
+        bgl.glDisable(bgl.GL_COLOR_LOGIC_OP)
+        bgl.glDisable(bgl.GL_DITHER)
+        bgl.glColorMask(True, True, True, True)
+        efbW, efbH = self.EFB_DIMS
+        if state.dof is not None and depth:
+            # in the game this happens right after the backgrounds are drawn, so it only ever
+            # blurs those. here it is applied to everything by depth
+            dof = state.dof
+            div = 4 if dof.quarterResolution else 2
+            small = (efbW // div, efbH // div)
+            reduced = self._pass("dofSmall", small, self.COPY_AREA, (image, ), (*small, 0, 0))
+            taps = int(dof.blurTaps)
+            radius = dof.blurRadius if taps > 1 else 0
+            blurred = self._pass("dofBlur", small, self.DOF_BLUR, (reduced, ),
+                                 (1 / small[0], 1 / small[1], radius, taps))
+            p = projectionMtx
+            isOrtho = p[3][3] == 1
+            if isOrtho:
+                near, far = (p[2][3] + 1) / p[2][2], (p[2][3] - 1) / p[2][2]
+            else:
+                near, far = p[2][3] / (p[2][2] - 1), p[2][3] / (p[2][2] + 1)
+            power = {'LINEAR': 1, 'SQUARED': 2, 'POWER_4': 4}[dof.depthCurve]
+            image = self._pass(
+                "dofResult", dims, self.DOF_COMPOSITE, (image, blurred, depth),
+                (dof.focusCenter, dof.focusRange, near, far),
+                (isOrtho, state.unitScale, power, dof.drawMode == 'SPLIT'),
+                (dof.nearStrength / 255, dof.farStrength / 255, 0, 0)
+            )
+        if state.bloom is not None:
+            bloom = state.bloom
+            bloomTexture = self._bloom(bloom, image)
+            color = [round(c * 255) for c in bloom.compositeColor]
+            blend = ('ADD', 'SCREEN', 'ADD_ALPHA', 'ALPHA', 'MULTIPLY_ADD').index(bloom.compositeBlend)
+            image = self._pass("bloomResult", dims, self.BLOOM_COMPOSITE, (image, bloomTexture),
+                               (*(self._tevFactor(c) for c in color[:3]), color[3] / 255),
+                               (blend, 0, 0, 0))
+        return image
+
+
 class BatchInfo:
     """Data necessary to create a GPU batch, independent from a shader."""
 
@@ -885,10 +1240,14 @@ class BrresRenderer(ABC, Generic[TextureManagerT, MaterialManagerT, ObjectManage
         self._materialManager: MaterialManagerT = None
         self._objectManager: ObjectManagerT = None
         self._batchManager = BatchManager(self.shader)
+        self.lighting = SceneLightingRenderer()
+        self.scene: bpy.types.Scene = None
+        """Scene this renderer draws, for its lighting settings."""
 
     def delete(self):
         """Clean up resources managed by this renderer."""
         self._textureManager.delete()
+        self.lighting.delete()
 
     def update(self, depsgraph: bpy.types.Depsgraph, context: bpy.types.Context = None):
         """Update this renderer's settings from a Blender depsgraph & optional context.
@@ -945,7 +1304,10 @@ class BrresRenderer(ABC, Generic[TextureManagerT, MaterialManagerT, ObjectManage
 
     def draw(self, projectionMtx: Matrix, viewMtx: Matrix):
         """Draw the current BRRES scene to the active framebuffer."""
+        if self.scene is not None:
+            self.lighting.update(self.scene, viewMtx, isinstance(self, BrresBglRenderer))
         self.preDraw()
+        self.shader.uniform_block("lighting", self.lighting.ubo)
         for (renderObject, renderMat, batchInfo) in self._objectManager.getDrawCalls():
             batch = self._batchManager.getBatch(batchInfo)
             self.processDrawCall(viewMtx, projectionMtx, renderObject, renderMat, batch)
@@ -992,6 +1354,7 @@ class BrresBglRenderer(BrresRenderer[BglTextureManager, StandardMaterialManager,
         mvMtx = viewMtx @ renderObject.matrix
         self.shader.uniform_bool("isConstAlphaWrite", [False])
         self.shader.uniform_float("modelViewProjectionMtx", projectionMtx @ mvMtx)
+        self.shader.uniform_float("modelViewMtx", mvMtx)
         self.shader.uniform_float("normalMtx", mvMtx.to_3x3().inverted_safe().transposed())
         self.shader.uniform_block("mesh", renderObject.ubo)
         # load material data
@@ -1002,7 +1365,8 @@ class BrresBglRenderer(BrresRenderer[BglTextureManager, StandardMaterialManager,
             for i, tex in enumerate(shaderMat.textures):
                 if tex.hasImg:
                     bgl.glActiveTexture(bgl.GL_TEXTURE0 + i)
-                    self._textureManager.bindTexture(tex)
+                    if not self.lighting.bindLightMap(tex):
+                        self._textureManager.bindTexture(tex)
             # dithering
             if shaderMat.enableDither:
                 bgl.glEnable(bgl.GL_DITHER)
@@ -1120,6 +1484,7 @@ class BrresPreviewRenderer(BrresRenderer[PreviewTextureManager, PreviewMaterialM
         mvMtx = viewMtx @ renderObject.matrix
         self.shader.uniform_bool("isConstAlphaWrite", [False])
         self.shader.uniform_float("modelViewProjectionMtx", projectionMtx @ mvMtx)
+        self.shader.uniform_float("modelViewMtx", mvMtx)
         self.shader.uniform_float("normalMtx", mvMtx.to_3x3().inverted_safe().transposed())
         self.shader.uniform_block("mesh", renderObject.ubo)
         # load material data
@@ -1160,6 +1525,7 @@ class BerryBushRenderEngine(bpy.types.RenderEngine):
         self.batch: gpu.types.GPUBatch = batch_for_shader(self.shader, 'TRIS', verts, indices=idcs)
         # offscreen
         self.offscreen: gpu.types.GPUOffScreen = None
+        self._lightingPost: LightingPostProcessor = None
         # dimensions
         self._updateDims((1, 1))
 
@@ -1176,6 +1542,8 @@ class BerryBushRenderEngine(bpy.types.RenderEngine):
                 assumeOpaqueMats = isTransparent and scene.brres.renderAssumeOpaqueMats
                 noTransparentOverwrite = isTransparent and scene.brres.renderNoTransparentOverwrite
                 renderer = BrresBglRenderer(assumeOpaqueMats, noTransparentOverwrite)
+                # previews are drawn without scene lighting, so only this renderer gets the scene
+                renderer.scene = scene
             self._sceneRenderers[scene.name] = renderer
             return renderer
 
@@ -1241,6 +1609,10 @@ class BerryBushRenderEngine(bpy.types.RenderEngine):
         # (seemingly not necessary after first frame, but i'm doing it every time anyway to be safe)
         activeFb = bgl.Buffer(bgl.GL_INT, 1)
         bgl.glGetIntegerv(bgl.GL_FRAMEBUFFER_BINDING, activeFb)
+        renderer = self._getSceneRenderer(scene)
+        depthTexture = 0
+        # (from the gpu module, as it applies the area it has on record lazily & opengl's may be stale)
+        viewport = gpu.state.viewport_get()
         # pass 1: main rendering
         with self.offscreen.bind():
             fb: gpu.types.GPUFrameBuffer = gpu.state.active_framebuffer_get()
@@ -1248,7 +1620,22 @@ class BerryBushRenderEngine(bpy.types.RenderEngine):
             bgl.glDepthMask(True)
             bgl.glStencilMask(0xFF)
             fb.clear(color=(*self._backgroundColor, 0), depth=1, stencil=0)
-            self._getSceneRenderer(scene).draw(projectionMtx, viewMtx)
+            renderer.draw(projectionMtx, viewMtx)
+            lightingState = renderer.lighting.state
+            usePost = lightingState is not None and (lightingState.dof or lightingState.bloom)
+            if usePost:
+                if self._lightingPost is None:
+                    self._lightingPost = LightingPostProcessor()
+                if lightingState.dof:
+                    depthTexture = self._lightingPost.depthTexture(self.dims)
+        doAlpha = scene.render.film_transparent and not self.isViewport
+        if usePost:
+            # the scene lighting's depth of field & bloom, then the usual post-processing
+            result = self._lightingPost.run(lightingState, projectionMtx,
+                                            self.offscreen.color_texture, depthTexture, self.dims)
+            bgl.glBindFramebuffer(bgl.GL_FRAMEBUFFER, activeFb[0]) # pylint: disable=unsubscriptable-object
+            self._lightingPost.output(result, doAlpha, tuple(viewport))
+            return
         # pass 2: post-processing
         bgl.glBindFramebuffer(bgl.GL_FRAMEBUFFER, activeFb[0]) # pylint: disable=unsubscriptable-object
         bgl.glActiveTexture(bgl.GL_TEXTURE0)
@@ -1375,6 +1762,8 @@ class FilmPanel(PropertyPanel):
         layout.use_property_decorate = False
         scene = context.scene
         render = scene.render
+        from .lighting import drawViewTransformWarning
+        drawViewTransformWarning(layout, context)
         layout.prop(render, "film_transparent")
         col = layout.row().column()
         col.prop(scene.brres, "renderAssumeOpaqueMats")

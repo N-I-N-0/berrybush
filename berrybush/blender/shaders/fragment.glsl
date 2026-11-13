@@ -32,22 +32,65 @@ vec3 getConstColor(int sel) {
     else if (sel < 32) { return material.constColors[sel - 28].aaa; }
 }
 
+vec4 getSceneLight(int chanIdx, ShaderLightChanSettings settings, bool isAlpha) {
+    // sum of what the lights of the material's light set add to a light channel
+    // (as gx calculates it, w/ the lights the game's scene lighting gives the set)
+    vec4 sum = vec4(0.0);
+    vec3 viewPos = (modelViewMtx * vec4(fragPosition, 1.0)).xyz * lighting.unitScale;
+    vec3 viewNormal = normalize(normalMtx * fragNormal);
+    ShaderLightSet lightSet = lighting.lightSets[material.lightSet];
+    for (int i = 0; i < 8; i++) {
+        int lightIdx = lightSet.lights[i];
+        if (lightIdx < 0) { continue; }
+        ShaderSceneLight light = lighting.lights[lightIdx];
+        // diffuse lights go to the first channel & specular ones to the second
+        if (light.kind != chanIdx + 1) { continue; }
+        if (isAlpha ? !light.useAlpha : !light.useColor) { continue; }
+        vec3 toLight = light.pos.xyz - viewPos;
+        float dist = length(toLight);
+        vec3 l = toLight / dist;
+        float attn = 1.0;
+        if (settings.atnMode == 1) { // spotlight
+            float c = max(dot(-l, light.dir.xyz), 0.0);
+            float angle = max(light.angleAttn.x + c * (light.angleAttn.y + c * light.angleAttn.z), 0.0);
+            attn = angle / (light.distAttn.x + dist * (light.distAttn.y + dist * light.distAttn.z));
+        }
+        else if (settings.atnMode == 0) { // specular
+            float c = (dot(viewNormal, l) > 0.0) ? max(dot(viewNormal, normalize(-light.dir.xyz)), 0.0) : 0.0;
+            float angle = max(light.angleAttn.x + c * (light.angleAttn.y + c * light.angleAttn.z), 0.0);
+            attn = angle / (light.distAttn.x + c * (light.distAttn.y + c * light.distAttn.z));
+        }
+        float diffuse = 1.0;
+        if (settings.difMode == 1) { diffuse = dot(viewNormal, l); }
+        else if (settings.difMode == 2) { diffuse = max(dot(viewNormal, l), 0.0); }
+        sum += light.color * diffuse * attn;
+    }
+    return sum;
+}
+
 vec4 getLightChanColor(int chanIdx) {
     // get color output for a light channel
     ShaderLightChan lc = material.lightChans[chanIdx];
     vec4 color;
     int constVertColor = mesh.colors[chanIdx];
     vec4 vertColor = (constVertColor == -1) ? fragColor[chanIdx] : vec4(constVertColor);
+    bool sceneLit = lighting.useLights && material.lightSet >= 0;
+    // g3d multiplies the ambient color of the first channel by that of the light set (white w/o one)
+    vec4 setAmbient = (sceneLit && chanIdx == 0) ? lighting.lightSets[material.lightSet].ambient : vec4(1.0);
     color.rgb = (lc.colorSettings.difFromReg) ? lc.difReg.rgb : vertColor.rgb;
     if (lc.colorSettings.difMode >= 0) {
         vec3 ambColor = (lc.colorSettings.ambFromReg) ? lc.ambReg.rgb : vertColor.rgb;
-        color.rgb *= ambColor;
+        vec3 illum = ambColor * setAmbient.rgb;
+        if (sceneLit) { illum += getSceneLight(chanIdx, lc.colorSettings, false).rgb; }
+        color.rgb *= clamp(illum, vec3(0.0), vec3(1.0));
     }
     // alpha
     color.a = (lc.alphaSettings.difFromReg) ? lc.difReg.a : vertColor.a;
     if (lc.alphaSettings.difMode >= 0) {
         float ambAlpha = (lc.alphaSettings.ambFromReg) ? lc.ambReg.a : vertColor.a;
-        color.a *= ambAlpha;
+        float illum = ambAlpha * setAmbient.a;
+        if (sceneLit) { illum += getSceneLight(chanIdx, lc.alphaSettings, true).a; }
+        color.a *= clamp(illum, 0.0, 1.0);
     }
     return color;
 }
@@ -289,6 +332,23 @@ void main() {
     // enable check just exists so that everything isn't discarded when ubo is empty (i.e., an object has no material set)
     if (material.alphaTestEnable && !alphaTest(fragOutput.a)) {
         discard;
+    }
+    // fog (as gx calculates it, from the distance in front of the camera)
+    if (lighting.useFog && material.fogSet >= 0) {
+        ShaderFog fog = lighting.fogs[material.fogSet];
+        // gx turns fog off when it has no range
+        if (fog.kind != 0 && fog.end != fog.start) {
+            float depth = -(modelViewMtx * vec4(fragPosition, 1.0)).z * lighting.unitScale;
+            float f = clamp((depth - fog.start) / (fog.end - fog.start), 0.0, 1.0);
+            int curve = fog.kind & 7;
+            switch (curve) {
+                case 4: f = 1.0 - pow(2.0, -8.0 * f); break;
+                case 5: f = 1.0 - pow(2.0, -8.0 * f * f); break;
+                case 6: f = pow(2.0, -8.0 * (1.0 - f)); break;
+                case 7: f = pow(2.0, -8.0 * (1.0 - f) * (1.0 - f)); break;
+            }
+            fragOutput.rgb = mix(fragOutput.rgb, fog.color.rgb, f);
+        }
     }
     if (forceOpaque) {
         // little hack for some spots in blender where alpha gets weird (one of the many material preview issues)

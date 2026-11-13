@@ -214,6 +214,39 @@ class ShaderLightChan(ShaderStruct):
         return rlc
 
 
+class ShaderSceneLight(ShaderStruct):
+    color = ShaderVec(ShaderFloat, 4)
+    pos = ShaderVec(ShaderFloat, 4)
+    dir = ShaderVec(ShaderFloat, 4)
+    angleAttn = ShaderVec(ShaderFloat, 4)
+    distAttn = ShaderVec(ShaderFloat, 4)
+    kind = ShaderInt # 0: off, 1: diffuse, 2: specular
+    useColor = ShaderBool
+    useAlpha = ShaderBool
+
+
+class ShaderLightSet(ShaderStruct):
+    ambient = ShaderVec(ShaderFloat, 4)
+    lights = ShaderArr(ShaderInt, 8)
+
+
+class ShaderFog(ShaderStruct):
+    color = ShaderVec(ShaderFloat, 4)
+    kind = ShaderInt
+    start = ShaderFloat
+    end = ShaderFloat
+
+
+class ShaderSceneLighting(ShaderStruct):
+    """The scene lighting of the game: lights, light sets and fogs."""
+    lights = ShaderArr(ShaderSceneLight, 40)
+    lightSets = ShaderArr(ShaderLightSet, 16)
+    fogs = ShaderArr(ShaderFog, 32)
+    useLights = ShaderBool
+    useFog = ShaderBool
+    unitScale = ShaderFloat
+
+
 class ShaderMaterial(ShaderStruct):
     colorSwaps = ShaderArr(ShaderVec(ShaderInt, 4), gx.MAX_COLOR_SWAPS)
     stages = ShaderArr(ShaderTevStage, gx.MAX_TEV_STAGES)
@@ -232,6 +265,8 @@ class ShaderMaterial(ShaderStruct):
     numStages = ShaderInt
     numTextures = ShaderInt
     numIndMtcs = ShaderInt
+    lightSet = ShaderInt
+    fogSet = ShaderInt
 
     blendSubtract: bool = False
     blendSrcFac: int = 0
@@ -283,7 +318,11 @@ RENDER_STRUCTS = (
     ShaderLightChanSettings,
     ShaderLightChan,
     ShaderMaterial,
-    ShaderMesh
+    ShaderMesh,
+    ShaderSceneLight,
+    ShaderLightSet,
+    ShaderFog,
+    ShaderSceneLighting
 )
 
 def compileBrresShader() -> gpu.types.GPUShader:
@@ -293,7 +332,9 @@ def compileBrresShader() -> gpu.types.GPUShader:
     shaderInfo.typedef_source("".join(s.getSource() for s in RENDER_STRUCTS))
     shaderInfo.uniform_buf(1, ShaderMaterial.getName(), "material")
     shaderInfo.uniform_buf(2, ShaderMesh.getName(), "mesh")
+    shaderInfo.uniform_buf(3, ShaderSceneLighting.getName(), "lighting")
     shaderInfo.push_constant('MAT4', "modelViewProjectionMtx")
+    shaderInfo.push_constant('MAT4', "modelViewMtx")
     shaderInfo.push_constant('MAT3', "normalMtx")
     shaderInfo.push_constant('BOOL', "forceOpaque")
     shaderInfo.push_constant('BOOL', "isConstAlphaWrite")
@@ -349,3 +390,27 @@ def compilePostprocessShader() -> gpu.types.GPUShader:
 
 
 POSTPROCESS_SHADER = compilePostprocessShader()
+
+
+def compileLightPostShader() -> gpu.types.GPUShader:
+    """Compile & return the shader for the post passes of the scene lighting (bloom & dof)."""
+    shaderInfo = gpu.types.GPUShaderCreateInfo()
+    for i in range(3):
+        shaderInfo.sampler(i, 'FLOAT_2D', f"tex{i}")
+    shaderInfo.push_constant('INT', "mode")
+    for i in range(3):
+        shaderInfo.push_constant('VEC4', f"p{i}")
+    shaderInfo.vertex_in(0, 'VEC2', "position")
+    interfaceInfo = gpu.types.GPUStageInterfaceInfo("shader_interface")
+    interfaceInfo.smooth('VEC2', "fragPosition")
+    shaderInfo.vertex_out(interfaceInfo)
+    shaderInfo.fragment_out(0, 'VEC4', "fragOutput")
+    shaderPath = (pathlib.Path(__file__).parent / "shaders").resolve()
+    with open(shaderPath / "postprocess" / "vertex.glsl", "r", encoding="utf-8") as f:
+        shaderInfo.vertex_source(f.read())
+    with open(shaderPath / "lightpost" / "fragment.glsl", "r", encoding="utf-8") as f:
+        shaderInfo.fragment_source(f.read())
+    return gpu.shader.create_from_info(shaderInfo)
+
+
+LIGHT_POST_SHADER = compileLightPostShader()
