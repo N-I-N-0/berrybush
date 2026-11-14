@@ -1,0 +1,45 @@
+# Publishes docs/wiki to the GitHub wiki of this repository whenever it changes on main.
+# The pages link their images from docs/images on main, so only the pages themselves are copied.
+# GitHub only creates the wiki repository once its first page has been saved in the web interface,
+# so that has to happen once before this can run.
+name: Publish wiki
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/wiki/**"
+      - ".github/workflows/wiki.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wiki
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Copy docs/wiki into the wiki repository
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git clone --depth 1 "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git" wiki-repo
+          # the folder is the source of the wiki, so pages that are no longer in it are removed
+          rsync -a --delete --exclude .git docs/wiki/ wiki-repo/
+          cd wiki-repo
+          git add -A
+          if git diff --cached --quiet
+          then
+            echo "The wiki is already up to date"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update the wiki from ${GITHUB_SHA::7}"
+          git push

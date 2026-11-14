@@ -1,27 +1,25 @@
-<img src="https://github.com/hayden0729/berrybush/blob/main/logo.png">
+<img src="logo.png">
 
-Blender addon for BRRES models, particularly with New Super Mario Bros. Wii modding in mind.
+Blender addon for BRRES models, adjusted for use during development of our mod New Super Mario Lost Worlds.
+
+The original berrybush addon can be found [here](https://github.com/hayden0729/berrybush).
 
 Main features include:
 - BRRES importer & exporter with support for most features of the format
 - Render engine and new material editing interface
 - Verifier to catch possible mistakes in model data
 
-BerryBush is targeted at Blender 3.3 LTS, but works with Blender 3.4 as well. Wider support is planned in the future. A more detailed summary of BerryBush's current scope and limitations can be found [here](https://github.com/hayden0729/berrybush/wiki/Scope-and-Limitations).
+BerryBush is targeted at Blender 3.3 LTS, but works with Blender 3.4 as well. Wider support is planned in the future. A more detailed summary of BerryBush's current scope and limitations can be found [here](https://github.com/N-I-N-0/berrybush/wiki/Scope-and-Limitations).
 
 # Installation
 
-Download the [latest release](https://github.com/hayden0729/berrybush/releases/latest). In Blender, open **Edit > Preferences... > Add-ons > Install...**, and then choose the ZIP file you downloaded. A more detailed step-by-step guide can be found [here](https://github.com/hayden0729/berrybush/wiki/Installation). After installation, check out the rest of [the wiki](https://github.com/hayden0729/berrybush/wiki) to get started.
+Download the [latest release](https://github.com/N-I-N-0/berrybush/releases/latest). In Blender, open **Edit > Preferences... > Add-ons > Install...**, and then choose the ZIP file you downloaded. A more detailed step-by-step guide can be found [here](https://github.com/N-I-N-0/berrybush/wiki/Installation). After installation, check out the rest of [the wiki](https://github.com/N-I-N-0/berrybush/wiki) to get started.
 
-The same process can be used to update BerryBush to a new version. You can also [uninstall the addon](https://github.com/hayden0729/berrybush/wiki/Installation#Uninstalling-BerryBush) from the same menu.
+The same process can be used to update BerryBush to a new version. You can also [uninstall the addon](https://github.com/N-I-N-0/berrybush/wiki/Installation#Uninstalling-BerryBush) from the same menu.
 
 # Support
 
-Detailed guides and documentation are available in [the wiki](https://github.com/hayden0729/berrybush/wiki). Additionally, if you're ever unsure what something does within Blender, you can hover over it to view its description.
-
-Feature requests, bug reports, documentation corrections, or other feedback are all welcome on [the issues page](https://github.com/hayden0729/berrybush/issues). If I don't respond, please don't hesitate to reach out over Discord (see below), as I am more active there. Note that this project is mainly intended for New Super Mario Bros. Wii modding, so although it may happen to work for other games, NSMBW-related features are the primary concern.
-
-You can always feel free to contact me on Discord (@hayden0729) in DMs or any of the modding servers ([Evolution](https://discord.gg/aZAaXVJ), [Horizon](https://discord.gg/XnQJnwa), [NHD](https://discord.gg/nXgyHrMyjA)).
+Detailed guides and documentation are available in [the wiki](https://github.com/N-I-N-0/berrybush/wiki). Additionally, if you're ever unsure what something does within Blender, you can hover over it to view its description.
 
 # Resources/Credits
 

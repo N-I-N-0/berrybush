@@ -1,0 +1,75 @@
+# Publishes a new release of the addon whenever the addon changes on main.
+# Each release gets the run number of this workflow as its build number and is tagged build-<number>.
+# The number is also written into berrybush/build.txt inside the zip, which is how the addon's update check
+# (berrybush/blender/updater.py) knows whether the latest release on GitHub is newer than the installed one.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "berrybush/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      BUILD: ${{ github.run_number }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find the changes since the last build
+        id: changes
+        run: |
+          previous=$(git describe --tags --abbrev=0 --match "build-*" HEAD 2>/dev/null || true)
+          echo "previous=${previous}" >> "$GITHUB_OUTPUT"
+          if [ -n "$previous" ] && git diff --quiet "$previous" HEAD -- berrybush
+          then
+            echo "The addon hasn't changed since ${previous}, so there's nothing to release"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package the addon
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          version=$(sed -n 's/^ *"version": *(\([0-9]*\), *\([0-9]*\), *\([0-9]*\)).*/\1.\2.\3/p' berrybush/__init__.py)
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+          echo "ZIP=berrybush-${version}-build-${BUILD}.zip" >> "$GITHUB_ENV"
+          echo "$BUILD" > berrybush/build.txt
+          zip -r -X "berrybush-${version}-build-${BUILD}.zip" berrybush
+
+      - name: Publish the release
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          PREVIOUS: ${{ steps.changes.outputs.previous }}
+        run: |
+          {
+            if [ -n "$PREVIOUS" ]
+            then
+              echo "Changes since ${PREVIOUS}:"
+              echo
+              git log --no-merges --format="- %s" "${PREVIOUS}..HEAD" -- berrybush
+              echo
+              echo "**Full Changelog**: https://github.com/${GH_REPO}/compare/${PREVIOUS}...build-${BUILD}"
+            else
+              git log --no-merges -1 --format="- %s" HEAD -- berrybush
+            fi
+            echo
+            echo "Download the ZIP below, not the source code archives, and install it as described [here](https://github.com/${GH_REPO}/wiki/Installation). Be sure to restart Blender after updating."
+          } > notes.md
+          gh release create "build-${BUILD}" "$ZIP" --target "$GITHUB_SHA" --title "BerryBush ${VERSION} build ${BUILD}" --notes-file notes.md

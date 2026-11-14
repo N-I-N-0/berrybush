@@ -1,5 +1,6 @@
 # standard imports
 import json
+import pathlib
 import urllib
 import urllib.request
 # 3rd party imports
@@ -9,38 +10,60 @@ from .common import paragraphLabel, getLayerData, setLayerData
 from .preferences import BerryBushPreferences, getPrefs
 
 
+RELEASES_API_URL = "https://api.github.com/repos/N-I-N-0/berrybush/releases/latest"
+"""GitHub API address of the newest release of this fork."""
+
+BUILD_TAG_PREFIX = "build-"
+"""Releases are tagged with this followed by their build number (see .github/workflows/release.yml)."""
+
+
+def readInstalledBuild() -> int | None:
+    """Build number of the installed release, or None if BerryBush wasn't installed from a release.
+
+    The release workflow writes the number into build.txt next to the addon's __init__.py.
+    """
+    try:
+        return int((pathlib.Path(__file__).parents[1] / "build.txt").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+INSTALLED_BUILD = readInstalledBuild()
+
+
 class LatestVersionChecker():
 
     def __init__(self):
         self._hasChecked = False
 
-    def _retrieveLatestRelease(self) -> tuple[tuple[int, int, int], str]:
-        """Get the tag & release URL for the latest available version of BerryBush from GitHub."""
-        url = "https://api.github.com/repos/hayden0729/berrybush/releases/latest"
-        with urllib.request.urlopen(url) as response:
+    def _retrieveLatestRelease(self) -> tuple[int, str]:
+        """Get the build number & release URL for the latest release of BerryBush from GitHub."""
+        with urllib.request.urlopen(RELEASES_API_URL, timeout=5) as response:
             data = json.load(response)
-            return (tuple(int(v) for v in data["tag_name"].split(".")), data["html_url"])
+            tag: str = data["tag_name"]
+            return (int(tag.removeprefix(BUILD_TAG_PREFIX)), data["html_url"])
 
-    def check(self, currentVer: tuple[int, int, int], prefs: BerryBushPreferences):
-        """Display a popup if a newer version of BerryBush than the installed one is available.
-        
-        (If this has already been done, do nothing)
+    def check(self, currentBuild: int | None, prefs: BerryBushPreferences):
+        """Display a popup if a newer build of BerryBush than the installed one is available.
+
+        (If this has already been done, or if BerryBush wasn't installed from a release, do nothing)
         """
-        if prefs.doUpdateChecks and not self._hasChecked:
-            self._hasChecked = True
-            try:
-                latestVer, url = self._retrieveLatestRelease()
-            except:
-                print("Failed to retrieve the latest BerryBush version from GitHub")
-                return
-            if not (prefs.skipThisVersion and latestVer == tuple(prefs.latestKnownVersion)):
-                # if the latest version isn't set to be skipped, always reset relevant prefs
-                prefs.latestKnownVersion = latestVer
-                prefs.skipThisVersion = False
-                # finally, do the actual check
-                if currentVer < latestVer:
-                    bpy.ops.brres.show_latest_version('INVOKE_DEFAULT',
-                                                      current=currentVer, latest=latestVer, url=url)
+        if currentBuild is None or not prefs.doUpdateChecks or self._hasChecked:
+            return
+        self._hasChecked = True
+        try:
+            latestBuild, url = self._retrieveLatestRelease()
+        except:
+            print("Failed to retrieve the latest BerryBush release from GitHub")
+            return
+        if not (prefs.skipThisBuild and latestBuild == prefs.latestKnownBuild):
+            # if the latest build isn't set to be skipped, always reset relevant prefs
+            prefs.latestKnownBuild = latestBuild
+            prefs.skipThisBuild = False
+            # finally, do the actual check
+            if currentBuild < latestBuild:
+                bpy.ops.brres.show_latest_version('INVOKE_DEFAULT',
+                                                  current=currentBuild, latest=latestBuild, url=url)
 
 
 LATEST_VERSION_CHECKER = LatestVersionChecker()
@@ -48,17 +71,17 @@ LATEST_VERSION_CHECKER = LatestVersionChecker()
 
 @bpy.app.handlers.persistent
 def checkLatestVer(_):
-    LATEST_VERSION_CHECKER.check(addonVer(), getPrefs(bpy.context))
+    LATEST_VERSION_CHECKER.check(INSTALLED_BUILD, getPrefs(bpy.context))
 
 
 class ShowLatestVersion(bpy.types.Operator):
-    """Link to the newest version of BerryBush."""
+    """Link to the newest build of BerryBush."""
 
     bl_idname = "brres.show_latest_version"
     bl_label = "BerryBush Update Available!"
 
-    current: bpy.props.IntVectorProperty(size=3)
-    latest: bpy.props.IntVectorProperty(size=3)
+    current: bpy.props.IntProperty()
+    latest: bpy.props.IntProperty()
     url: bpy.props.StringProperty()
 
     def execute(self, context: bpy.types.Context):
@@ -70,15 +93,13 @@ class ShowLatestVersion(bpy.types.Operator):
 
     def draw(self, context: bpy.types.Context):
         preferences = getPrefs(context)
-        currentStr = verStr(self.current)
-        latestStr = verStr(self.latest)
-        label = f"Click OK to view the latest release ({currentStr} → {latestStr})"
+        label = f"Click OK to view the latest release (build {self.current} → build {self.latest})"
         self.layout.label(text=label)
         row = self.layout.row().split(factor=.5)
         row.prop(preferences, "doUpdateChecks", invert_checkbox=True, text="Disable Update Checks")
         skipRow = row.row()
         skipRow.enabled = preferences.doUpdateChecks
-        skipRow.prop(preferences, "skipThisVersion")
+        skipRow.prop(preferences, "skipThisBuild")
 
 
 @bpy.app.handlers.persistent

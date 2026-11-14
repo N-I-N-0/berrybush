@@ -52,7 +52,7 @@ bl_info = {
     "blender" : (3, 3, 0),
     "location": "File > Import-Export",
     "description": "NSMBW focused BRRES support",
-    "doc_url": "https://github.com/hayden0729/berrybush/wiki",
+    "doc_url": "https://github.com/N-I-N-0/berrybush/wiki",
     "category" : "Import-Export"
 }
 

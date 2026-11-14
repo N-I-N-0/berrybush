@@ -42,11 +42,11 @@ class BerryBushPreferences(bpy.types.AddonPreferences):
         default=True
     )
 
-    skipThisVersion: bpy.props.BoolProperty(
-        name="Skip This Version"
+    skipThisBuild: bpy.props.BoolProperty(
+        name="Skip This Build"
     )
 
-    latestKnownVersion: bpy.props.IntVectorProperty(size=3)
+    latestKnownBuild: bpy.props.IntProperty()
 
     def draw(self, context):
         # backup stuff
@@ -58,11 +58,16 @@ class BerryBushPreferences(bpy.types.AddonPreferences):
         drawCheckedProp(col, self, "doMaxBackups", self, "maxBackups")
         self.layout.operator("brres.clear_backups")
         # update stuff
+        from .updater import INSTALLED_BUILD # pylint: disable=import-outside-toplevel
+        if INSTALLED_BUILD is None:
+            self.layout.label(text="Not installed from a release, so there are no update checks")
+            return
+        self.layout.label(text=f"Installed build: {INSTALLED_BUILD}")
         row = self.layout.row().split(factor=.5)
         row.prop(self, "doUpdateChecks")
         skipRow = row.row()
         skipRow.enabled = self.doUpdateChecks
-        skipRow.prop(self, "skipThisVersion")
+        skipRow.prop(self, "skipThisBuild")
 
 
 def getPrefs(context: bpy.types.Context) -> BerryBushPreferences:
